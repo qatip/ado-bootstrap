@@ -173,8 +173,8 @@ function Configure-AdoBasic {
   # Force correct values in the unattend file
   $machine = $env:COMPUTERNAME
   $sqlLine = "SqlInstance=localhost\$SqlInstanceName"
-  $siteBindingsLine = "SiteBindings=http:*:$Port:"
-  $publicUrlLine = "PublicUrl=http://$machine`:$Port/"
+  $siteBindingsLine = "SiteBindings=http:*:$($Port):"
+  $publicUrlLine = "PublicUrl=http://$machine`:$($Port)/"
 
   Log "[INFO] Updating unattend file values..."
   (Get-Content $iniPath) `
@@ -271,5 +271,6 @@ try {
 finally {
   try { Stop-Transcript } catch {}
 }
+
 
 
