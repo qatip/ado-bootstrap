@@ -27,6 +27,10 @@ function Assert-Admin {
   }
 }
 
+function Refresh-Path {
+  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+}
+
 function Ensure-Choco {
   Ensure-Tls12
   if (-not (Get-Command choco -ErrorAction SilentlyContinue)) {
@@ -37,9 +41,7 @@ function Ensure-Choco {
   } else {
     Log "[INFO] Chocolatey already installed."
   }
-
-  # Refresh PATH for this process (CSE sessions can have stale PATH)
-  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+  Refresh-Path
 }
 
 function Install-IisPrereqs {
@@ -98,7 +100,10 @@ function Ensure-SqlExpress {
   param([string]$Instance)
 
   Log "[INFO] Installing SQL Server Express (Chocolatey package)..."
-  choco install sql-server-express -y --no-progress
+  # Critical: grant local Administrators SQL sysadmin so 'azureuser' can configure ADO
+  # Chocolatey passes these to the installer.
+  $params = "/SQLSYSADMINACCOUNTS=`"BUILTIN\Administrators`""
+  choco install sql-server-express -y --no-progress --params "`'$params`'"
 
   Log "[INFO] Checking SQL Express service..."
   $svcName = "MSSQL`$$Instance"
@@ -110,7 +115,7 @@ function Ensure-SqlExpress {
 
 function Install-AdoExpress {
   $adoExe = "C:\Tools\azuredevopsexpress2022.2.exe"
-  $adoUrl = "https://go.microsoft.com/fwlink/?LinkId=2269947"
+  $adoUrl = "https://go.microsoft.com/fwlink/?LinkId=2269947"  # Express 2022.2
 
   if (-not (Test-Path $adoExe)) {
     Log "[INFO] Downloading ADO Server Express installer..."
@@ -128,7 +133,7 @@ function Install-AdoExpress {
       Log "[INFO] ADO installer completed (exit code 0)."
     }
     3010 {
-      Log "[INFO] ADO installer completed (exit code 3010 = reboot required)."
+      Log "[INFO] ADO installer completed (exit code 3010 = reboot required). Continuing without reboot..."
       $global:RebootRequired = $true
     }
     default {
@@ -159,6 +164,7 @@ function Configure-AdoBasic {
   if (-not $tfsConfig) { throw "Could not find TfsConfig.exe after installation." }
 
   $iniPath = "C:\Tools\ado-basic.ini"
+
   if (-not (Test-Path $iniPath)) {
     Log "[INFO] Creating unattend file..."
     & $tfsConfig unattend /create /type:basic /unattendfile:$iniPath | Out-Null
@@ -179,27 +185,49 @@ function Configure-AdoBasic {
   Log "[INFO] BASIC configuration completed."
 }
 
-function Wait-ForAdo {
-  param([int]$Port)
+function Wait-ForPort {
+  param([int]$Port, [int]$TimeoutSec = 300)
+
+  Log "[INFO] Waiting for TCP port $Port to listen..."
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
+
+  while ((Get-Date) -lt $deadline) {
+    $listening = $false
+    try {
+      $out = netstat -ano | Select-String ":$Port\s+LISTENING"
+      if ($out) { $listening = $true }
+    } catch {}
+
+    if ($listening) {
+      Log "[INFO] Port $Port is LISTENING."
+      return
+    }
+
+    Start-Sleep -Seconds 5
+  }
+
+  throw "Port $Port did not become LISTENING within $TimeoutSec seconds."
+}
+
+function Wait-ForHttp {
+  param([int]$Port, [int]$TimeoutSec = 300)
 
   $url = "http://localhost:$Port/tfs"
-  Log "[INFO] Waiting for ADO to respond at $url ..."
+  Log "[INFO] Waiting for HTTP response from $url ..."
+  $deadline = (Get-Date).AddSeconds($TimeoutSec)
 
-  $deadline = (Get-Date).AddMinutes(5)
   while ((Get-Date) -lt $deadline) {
     try {
       Ensure-Tls12
       $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
-      if ($r.StatusCode -ge 200 -and $r.StatusCode -lt 500) {
-        Log "[INFO] ADO responded with HTTP $($r.StatusCode)."
-        return
-      }
+      Log "[INFO] HTTP responded: $($r.StatusCode)"
+      return
     } catch {
       Start-Sleep -Seconds 5
     }
   }
 
-  throw "ADO did not respond at $url within 5 minutes."
+  throw "No HTTP response from $url within $TimeoutSec seconds."
 }
 
 # ---------------------------
@@ -214,18 +242,22 @@ try {
   Ensure-Choco
   Ensure-SqlExpress -Instance $SqlInstance
   Install-AdoExpress
+  Configure-AdoBasic -Port $AdoPort -Instance $SqlInstance -Collection $CollectionName
 
+  # Verify listener
+  Wait-ForPort -Port $AdoPort -TimeoutSec 600
+  Wait-ForHttp -Port $AdoPort -TimeoutSec 600
+
+  Log "[INFO] SUCCESS. Browse (inside VM): http://localhost:$AdoPort/tfs"
+  Log "[INFO] If NSG allows, browse externally: http://<VM_PUBLIC_IP>:$AdoPort/tfs"
+
+  # Only reboot after successful config/verification
   if ($global:RebootRequired) {
-    Log "[INFO] Reboot required after ADO install. Restarting now..."
+    Log "[INFO] Reboot was requested by installer (3010). Rebooting now AFTER successful configuration..."
     Stop-Transcript
     Restart-Computer -Force
     exit 0
   }
-
-  Configure-AdoBasic -Port $AdoPort -Instance $SqlInstance -Collection $CollectionName
-  Wait-ForAdo -Port $AdoPort
-
-  Log "[INFO] Done. Browse (inside VM): http://localhost:$AdoPort/tfs"
 }
 finally {
   try { Stop-Transcript } catch {}
