@@ -155,7 +155,8 @@ function Find-TfsConfig {
 
 function Configure-AdoBasic {
   param(
-    [string]$Instance,
+    [int]$Port,
+    [string]$SqlInstanceName,
     [string]$Collection
   )
 
@@ -164,18 +165,27 @@ function Configure-AdoBasic {
 
   $iniPath = "C:\Tools\ado-basic.ini"
 
+  Log "[INFO] Creating unattend file (if missing)..."
   if (-not (Test-Path $iniPath)) {
-    Log "[INFO] Creating unattend file..."
     & $tfsConfig unattend /create /type:basic /unattendfile:$iniPath | Out-Null
-  } else {
-    Log "[INFO] Unattend file already exists: $iniPath"
   }
 
-  # Keep inputs minimal and known-good
-  $inputs = "SqlInstance=.\$Instance;CollectionName=$Collection"
+  # Force correct values in the unattend file
+  $machine = $env:COMPUTERNAME
+  $sqlLine = "SqlInstance=localhost\$SqlInstanceName"
+  $siteBindingsLine = "SiteBindings=http:*:$Port:"
+  $publicUrlLine = "PublicUrl=http://$machine`:$Port/"
 
-  Log "[INFO] Running BASIC configuration (minimal inputs)..."
-  & $tfsConfig unattend /configure /type:basic /inputs:$inputs | Out-Host
+  Log "[INFO] Updating unattend file values..."
+  (Get-Content $iniPath) `
+    -replace '^SqlInstance=.*$', $sqlLine `
+    -replace '^SiteBindings=.*$', $siteBindingsLine `
+    -replace '^PublicUrl=.*$', $publicUrlLine `
+    -replace '^CollectionName=.*$', "CollectionName=$Collection" |
+    Set-Content -Path $iniPath -Encoding UTF8
+
+  Log "[INFO] Running BASIC configuration using unattend file..."
+  & $tfsConfig unattend /configure /type:basic /unattendfile:$iniPath | Out-Host
 
   if ($LASTEXITCODE -ne 0) {
     throw "TfsConfig returned exit code $LASTEXITCODE"
@@ -241,7 +251,7 @@ try {
   Ensure-Choco
   Ensure-SqlExpress -Instance $SqlInstance
   Install-AdoExpress
-  Configure-AdoBasic -Instance $SqlInstance -Collection $CollectionName
+  Configure-AdoBasic -Port $AdoPort -SqlInstanceName $SqlInstance -Collection $CollectionName
 
   # Verify listener
   Wait-ForPort -Port $AdoPort -TimeoutSec 600
@@ -261,4 +271,5 @@ try {
 finally {
   try { Stop-Transcript } catch {}
 }
+
 
