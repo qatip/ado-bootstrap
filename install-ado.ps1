@@ -155,7 +155,6 @@ function Find-TfsConfig {
 
 function Configure-AdoBasic {
   param(
-    [int]$Port,
     [string]$Instance,
     [string]$Collection
   )
@@ -172,10 +171,10 @@ function Configure-AdoBasic {
     Log "[INFO] Unattend file already exists: $iniPath"
   }
 
-  $publicUrl = "http://localhost:$Port/tfs"
-  $inputs = "SqlInstance=.\$Instance;CollectionName=$Collection;PublicUrl=$publicUrl;WebSiteVDirName=tfs;WebSitePort=$Port"
+  # Keep inputs minimal and known-good
+  $inputs = "SqlInstance=.\$Instance;CollectionName=$Collection"
 
-  Log "[INFO] Running BASIC configuration..."
+  Log "[INFO] Running BASIC configuration (minimal inputs)..."
   & $tfsConfig unattend /configure /type:basic /inputs:$inputs | Out-Host
 
   if ($LASTEXITCODE -ne 0) {
@@ -242,7 +241,7 @@ try {
   Ensure-Choco
   Ensure-SqlExpress -Instance $SqlInstance
   Install-AdoExpress
-  Configure-AdoBasic -Port $AdoPort -Instance $SqlInstance -Collection $CollectionName
+  Configure-AdoBasic -Instance $SqlInstance -Collection $CollectionName
 
   # Verify listener
   Wait-ForPort -Port $AdoPort -TimeoutSec 600
@@ -262,3 +261,4 @@ try {
 finally {
   try { Stop-Transcript } catch {}
 }
+
