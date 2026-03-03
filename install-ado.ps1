@@ -170,11 +170,10 @@ function Configure-AdoBasic {
     & $tfsConfig unattend /create /type:basic /unattendfile:$iniPath | Out-Null
   }
 
-  # Force correct values in the unattend file
   $machine = $env:COMPUTERNAME
-  $sqlLine = "SqlInstance=localhost\$SqlInstanceName"
+  $sqlLine         = "SqlInstance=localhost\$SqlInstanceName"
   $siteBindingsLine = "SiteBindings=http:*:$($Port):"
-  $publicUrlLine = "PublicUrl=http://$machine`:$($Port)/"
+  $publicUrlLine    = "PublicUrl=http://$machine`:$($Port)/"
 
   Log "[INFO] Updating unattend file values..."
   (Get-Content $iniPath) `
@@ -193,6 +192,7 @@ function Configure-AdoBasic {
 
   Log "[INFO] BASIC configuration completed."
 }
+
 
 function Wait-ForPort {
   param([int]$Port, [int]$TimeoutSec = 300)
@@ -271,6 +271,7 @@ try {
 finally {
   try { Stop-Transcript } catch {}
 }
+
 
 
 
