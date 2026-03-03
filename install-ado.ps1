@@ -5,11 +5,7 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
-$global:RebootRequired = $false
 
-# ---------------------------
-# Logging
-# ---------------------------
 New-Item -ItemType Directory -Force -Path "C:\Tools" | Out-Null
 Start-Transcript -Path "C:\Tools\install-ado.log" -Append
 
@@ -19,16 +15,16 @@ function Ensure-Tls12 {
   try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch {}
 }
 
+function Refresh-Path {
+  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
+}
+
 function Assert-Admin {
   $id = [Security.Principal.WindowsIdentity]::GetCurrent()
   $p  = New-Object Security.Principal.WindowsPrincipal($id)
   if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
     throw "Run as Administrator."
   }
-}
-
-function Refresh-Path {
-  $env:Path = [Environment]::GetEnvironmentVariable("Path","Machine") + ";" + [Environment]::GetEnvironmentVariable("Path","User")
 }
 
 function Ensure-Choco {
@@ -45,7 +41,7 @@ function Ensure-Choco {
 }
 
 function Install-IisPrereqs {
-  Log "[INFO] Installing IIS prerequisites for Azure DevOps Server..."
+  Log "[INFO] Installing IIS prerequisites..."
   Import-Module ServerManager
 
   $features = @(
@@ -55,90 +51,70 @@ function Install-IisPrereqs {
     "Web-Default-Doc",
     "Web-Static-Content",
     "Web-Http-Errors",
-    "Web-Http-Redirect",
     "Web-Http-Logging",
-    "Web-Log-Libraries",
     "Web-Request-Monitor",
     "Web-Filtering",
     "Web-Stat-Compression",
     "Web-Dyn-Compression",
-
     "Web-Security",
     "Web-Windows-Auth",
-
     "Web-App-Dev",
     "Web-Net-Ext45",
     "Web-Asp-Net45",
     "Web-ISAPI-Ext",
     "Web-ISAPI-Filter",
-
     "Web-Mgmt-Tools",
     "Web-Mgmt-Console",
-    "Web-Mgmt-Service",
-
     "NET-Framework-45-Core",
     "NET-Framework-45-ASPNET"
   )
 
-  $missing = @()
-  foreach ($f in $features) {
-    $feat = Get-WindowsFeature $f
-    if ($null -eq $feat -or $feat.InstallState -ne "Installed") { $missing += $f }
-  }
-
-  if ($missing.Count -gt 0) {
-    Log "[INFO] Installing missing IIS/.NET features..."
-    $result = Install-WindowsFeature -Name $features -IncludeManagementTools
-    if (-not $result.Success) { throw "Failed to install required IIS features." }
-    Log "[INFO] IIS/.NET prerequisites installed."
-  } else {
-    Log "[INFO] IIS/.NET prerequisites already installed."
-  }
+  $result = Install-WindowsFeature -Name $features -IncludeManagementTools
+  if (-not $result.Success) { throw "Failed to install IIS prerequisites." }
+  Log "[INFO] IIS prerequisites installed."
 }
 
 function Ensure-SqlExpress {
   param([string]$Instance)
 
-  Log "[INFO] Installing SQL Server Express (Chocolatey package)..."
-  # Critical: grant local Administrators SQL sysadmin so 'azureuser' can configure ADO
-  # Chocolatey passes these to the installer.
+  Log "[INFO] Installing SQL Server Express..."
+  # Guarantee local Administrators are SQL sysadmin so students (local admins) can configure ADO.
   $params = "/SQLSYSADMINACCOUNTS=`"BUILTIN\Administrators`""
   choco install sql-server-express -y --no-progress --params "`'$params`'"
 
-  Log "[INFO] Checking SQL Express service..."
+  Log "[INFO] Ensuring SQL Express service is running..."
   $svcName = "MSSQL`$$Instance"
   $svc = Get-Service -Name $svcName -ErrorAction SilentlyContinue
   if ($null -eq $svc) { throw "SQL service $svcName not found after install." }
   if ($svc.Status -ne "Running") { Start-Service $svc.Name }
-  Log "[INFO] SQL Express service is running."
+
+  Log "[INFO] SQL Express is running."
 }
 
 function Install-AdoExpress {
   $adoExe = "C:\Tools\azuredevopsexpress2022.2.exe"
-  $adoUrl = "https://go.microsoft.com/fwlink/?LinkId=2269947"  # Express 2022.2
+  $adoUrl = "https://go.microsoft.com/fwlink/?LinkId=2269947"
 
   if (-not (Test-Path $adoExe)) {
-    Log "[INFO] Downloading ADO Server Express installer..."
+    Log "[INFO] Downloading Azure DevOps Server Express installer..."
     Ensure-Tls12
     Invoke-WebRequest -Uri $adoUrl -OutFile $adoExe -UseBasicParsing
   } else {
     Log "[INFO] ADO installer already present."
   }
 
-  Log "[INFO] Installing ADO Server Express (silent)..."
+  Log "[INFO] Installing Azure DevOps Server Express..."
   $p = Start-Process -FilePath $adoExe -ArgumentList "/quiet","/norestart" -Wait -PassThru
 
-  switch ($p.ExitCode) {
-    0 {
-      Log "[INFO] ADO installer completed (exit code 0)."
-    }
-    3010 {
-      Log "[INFO] ADO installer completed (exit code 3010 = reboot required). Continuing without reboot..."
-      $global:RebootRequired = $true
-    }
-    default {
-      throw "ADO installer failed with exit code $($p.ExitCode)"
-    }
+  if ($p.ExitCode -eq 0) {
+    Log "[INFO] ADO installer completed (0)."
+  }
+  elseif ($p.ExitCode -eq 3010) {
+    Log "[INFO] ADO installer completed (3010 = reboot required). Not rebooting automatically."
+    Log "[INFO] If the Admin Console requests it later, reboot once."
+  }
+  else {
+    throw "ADO installer failed with exit code $($p.ExitCode)"
   }
 }
 
@@ -153,7 +129,7 @@ function Find-TfsConfig {
   return $tfsConfig
 }
 
-function Configure-AdoBasic {
+function Prepare-AdoUnattendFile {
   param(
     [int]$Port,
     [string]$SqlInstanceName,
@@ -161,117 +137,51 @@ function Configure-AdoBasic {
   )
 
   $tfsConfig = Find-TfsConfig
-  if (-not $tfsConfig) { throw "Could not find TfsConfig.exe after installation." }
+  if (-not $tfsConfig) { throw "TfsConfig.exe not found (ADO likely not installed)." }
 
   $iniPath = "C:\Tools\ado-basic.ini"
 
-  Log "[INFO] Creating unattend file (if missing)..."
-  if (-not (Test-Path $iniPath)) {
-    & $tfsConfig unattend /create /type:basic /unattendfile:$iniPath | Out-Null
-  }
+  Log "[INFO] Creating ADO unattend file..."
+  $createArgs = @("unattend","/create","/type:basic","/unattendfile:$iniPath")
+  & $tfsConfig @createArgs | Out-Null
+
+  if (-not (Test-Path $iniPath)) { throw "Unattend file was not created at $iniPath" }
 
   $machine = $env:COMPUTERNAME
-  $sqlLine         = "SqlInstance=localhost\$SqlInstanceName"
-  $siteBindingsLine = "SiteBindings=http:*:$($Port):"
-  $publicUrlLine    = "PublicUrl=http://$machine`:$($Port)/"
+
+  $sqlLine          = "SqlInstance=localhost\$SqlInstanceName"
+  $siteBindingsLine  = "SiteBindings=http:*:$($Port):"
+  $publicUrlLine     = "PublicUrl=http://$machine`:$($Port)/"
+  $collectionLine    = "CollectionName=$Collection"
+  $urlHostLine       = "UrlHostNameAlias=$machine"
 
   Log "[INFO] Updating unattend file values..."
   (Get-Content $iniPath) `
     -replace '^SqlInstance=.*$', $sqlLine `
     -replace '^SiteBindings=.*$', $siteBindingsLine `
     -replace '^PublicUrl=.*$', $publicUrlLine `
-    -replace '^CollectionName=.*$', "CollectionName=$Collection" |
+    -replace '^CollectionName=.*$', $collectionLine `
+    -replace '^UrlHostNameAlias=.*$', $urlHostLine |
     Set-Content -Path $iniPath -Encoding UTF8
 
-  Log "[INFO] Running BASIC configuration using unattend file..."
-  & $tfsConfig unattend /configure /type:basic /unattendfile:$iniPath | Out-Host
-
-  if ($LASTEXITCODE -ne 0) {
-    throw "TfsConfig returned exit code $LASTEXITCODE"
-  }
-
-  Log "[INFO] BASIC configuration completed."
+  Log "[INFO] Unattend file prepared at: $iniPath"
+  Log "[INFO] Next step (manual, reliable): Open 'Azure DevOps Server Administration Console' -> Configure Installed Features -> Basic"
+  Log "[INFO] Use SQL instance: localhost\$SqlInstanceName and port $Port if prompted."
 }
 
-
-function Wait-ForPort {
-  param([int]$Port, [int]$TimeoutSec = 300)
-
-  Log "[INFO] Waiting for TCP port $Port to listen..."
-  $deadline = (Get-Date).AddSeconds($TimeoutSec)
-
-  while ((Get-Date) -lt $deadline) {
-    $listening = $false
-    try {
-      $out = netstat -ano | Select-String ":$Port\s+LISTENING"
-      if ($out) { $listening = $true }
-    } catch {}
-
-    if ($listening) {
-      Log "[INFO] Port $Port is LISTENING."
-      return
-    }
-
-    Start-Sleep -Seconds 5
-  }
-
-  throw "Port $Port did not become LISTENING within $TimeoutSec seconds."
-}
-
-function Wait-ForHttp {
-  param([int]$Port, [int]$TimeoutSec = 300)
-
-  $url = "http://localhost:$Port/tfs"
-  Log "[INFO] Waiting for HTTP response from $url ..."
-  $deadline = (Get-Date).AddSeconds($TimeoutSec)
-
-  while ((Get-Date) -lt $deadline) {
-    try {
-      Ensure-Tls12
-      $r = Invoke-WebRequest -Uri $url -UseBasicParsing -TimeoutSec 10
-      Log "[INFO] HTTP responded: $($r.StatusCode)"
-      return
-    } catch {
-      Start-Sleep -Seconds 5
-    }
-  }
-
-  throw "No HTTP response from $url within $TimeoutSec seconds."
-}
-
-# ---------------------------
-# Main
-# ---------------------------
 try {
   Assert-Admin
   Ensure-Tls12
 
-  Log "[INFO] Starting ADO Express install + config..."
+  Log "[INFO] === Installing prerequisites, SQL, and ADO Express (no auto-config) ==="
   Install-IisPrereqs
   Ensure-Choco
   Ensure-SqlExpress -Instance $SqlInstance
   Install-AdoExpress
-  Configure-AdoBasic -Port $AdoPort -SqlInstanceName $SqlInstance -Collection $CollectionName
+  Prepare-AdoUnattendFile -Port $AdoPort -SqlInstanceName $SqlInstance -Collection $CollectionName
 
-  # Verify listener
-  Wait-ForPort -Port $AdoPort -TimeoutSec 600
-  Wait-ForHttp -Port $AdoPort -TimeoutSec 600
-
-  Log "[INFO] SUCCESS. Browse (inside VM): http://localhost:$AdoPort/tfs"
-  Log "[INFO] If NSG allows, browse externally: http://<VM_PUBLIC_IP>:$AdoPort/tfs"
-
-  # Only reboot after successful config/verification
-  if ($global:RebootRequired) {
-    Log "[INFO] Reboot was requested by installer (3010). Rebooting now AFTER successful configuration..."
-    Stop-Transcript
-    Restart-Computer -Force
-    exit 0
-  }
+  Log "[INFO] DONE."
 }
 finally {
   try { Stop-Transcript } catch {}
 }
-
-
-
-
