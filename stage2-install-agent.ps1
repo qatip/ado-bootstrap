@@ -1,29 +1,71 @@
 param(
-  [Parameter(Mandatory=$true)][string]$AdoUrl,   # e.g. http://vm-devops:8080/  (or http://<public-ip>:8080/)
-  [Parameter(Mandatory=$true)][string]$Pat,
-  [string]$Pool = "Default",
-  [string]$AgentName = $env:COMPUTERNAME
+  [string]$AdoUrl,                 # e.g. http://vm-devops:8080/
+  [string]$Pat,                    # PAT string
+  [string]$Pool = "Default",       # Agent pool name
+  [string]$AgentName = $env:COMPUTERNAME,
+  [string]$AgentVersion = "4.268.0"
 )
 
 $ErrorActionPreference = "Stop"
+
 New-Item -ItemType Directory -Force -Path "C:\Tools" | Out-Null
+Start-Transcript -Path "C:\Tools\install-agent.log" -Append
 
-$agentVersion = "4.268.0"
-$agentZip = "C:\Tools\vsts-agent-win-x64-$agentVersion.zip"
-$agentUrl = "https://download.agent.dev.azure.com/agent/$agentVersion/vsts-agent-win-x64-$agentVersion.zip"
-$agentDir = "C:\ado-agent"
+function Log { param([string]$m) Write-Host "[INFO] $m" }
+function Assert-Admin {
+  $id = [Security.Principal.WindowsIdentity]::GetCurrent()
+  $p  = New-Object Security.Principal.WindowsPrincipal($id)
+  if (-not $p.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw "Run as Administrator."
+  }
+}
 
-Write-Host "[INFO] Downloading agent $agentVersion..."
-Invoke-WebRequest -Uri $agentUrl -OutFile $agentZip -UseBasicParsing
+try {
+  Assert-Admin
 
-Write-Host "[INFO] Extracting to $agentDir..."
-New-Item -ItemType Directory -Force -Path $agentDir | Out-Null
-Expand-Archive -Path $agentZip -DestinationPath $agentDir -Force
+  if ([string]::IsNullOrWhiteSpace($AdoUrl)) { throw "AdoUrl is required (e.g. http://vm-devops:8080/)." }
+  if ([string]::IsNullOrWhiteSpace($Pat))    { throw "Pat is required." }
 
-Set-Location $agentDir
+  $agentZip = "C:\Tools\vsts-agent-win-x64-$AgentVersion.zip"
+  $agentUri = "https://download.agent.dev.azure.com/agent/$AgentVersion/vsts-agent-win-x64-$AgentVersion.zip"
+  $agentDir = "C:\ado-agent"
 
-Write-Host "[INFO] Configuring agent (unattended) ..."
-cmd.exe /c "config.cmd --unattended --url `"$AdoUrl`" --auth pat --token `"$Pat`" --pool `"$Pool`" --agent `"$AgentName`" --work _work --runAsService --acceptTeeEula"
+  Log "Downloading Azure Pipelines agent $AgentVersion..."
+  Invoke-WebRequest -Uri $agentUri -OutFile $agentZip -UseBasicParsing
 
-Write-Host "[OK] Agent installed as a Windows service."
-Write-Host "     Check Services: Azure Pipelines Agent ($AgentName)"
+  Log "Extracting agent..."
+  New-Item -ItemType Directory -Force -Path $agentDir | Out-Null
+  Expand-Archive -Path $agentZip -DestinationPath $agentDir -Force
+
+  Set-Location $agentDir
+
+  # Clean any previous config (safe if not configured)
+  if (Test-Path ".\config.cmd") {
+    Log "Configuring agent (unattended)..."
+  } else {
+    throw "config.cmd not found in $agentDir"
+  }
+
+  # Unattended config
+  # --runAsService installs/sets service
+  # --windowsLogonAccount/Password omitted -> runs as default service account
+  .\config.cmd --unattended `
+    --url "$AdoUrl" `
+    --auth pat `
+    --token "$Pat" `
+    --pool "$Pool" `
+    --agent "$AgentName" `
+    --acceptTeeEula `
+    --runAsService `
+    --work "_work" `
+    --replace
+
+  Log "Starting agent service..."
+  .\run.cmd --startuptype service | Out-Null
+
+  Log "Done. Verify service is running:"
+  Log "  Get-Service | ? Name -like 'vstsagent*'"
+}
+finally {
+  try { Stop-Transcript } catch {}
+}
